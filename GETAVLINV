@@ -1,0 +1,130 @@
+*free
+       Ctl-Opt  debug option(*NODEBUGIO : *SRCSTMT );
+       Ctl-Opt  dftactgrp(*no) actgrp(*caller);
+       Ctl-Opt  thread(*serialize);
+
+       dcl-pr GETAVLINV              extpgm('GETAVLINV');
+         item                        char(12) const;
+         size                        char(3) const;
+         mondayDate                  date const;
+         requested                   zoned(11:2) const;
+         available                   zoned(11:2);
+       end-pr;
+       dcl-pi GETAVLINV;
+         item                        char(12) const;
+         size                        char(3) const;
+         mondayDate                  date const;
+         requested                   zoned(11:2) const;
+         available                   zoned(11:2);
+       end-pi;
+       dcl-pr qCmdExc extpgm ;
+         *n char(1000) options(*varsize) const ;
+         *n packed(15:5) const ;
+       end-pr ;
+
+
+       dcl-ds FMINVT_DS  EXTNAME('FMINVT') end-ds;
+       dcl-s  Command VARCHAR(1000);
+
+       SqlState = '00000';
+
+       checkLot_SP();          // Test if available in LOT
+       If available = 0;
+         checkCustom_SP();     // Test if available to Sow Custom
+       EndIf;
+       If available > requested;
+         available = requested;
+       ENDIF;
+
+       Return ;
+
+       //---------------------------------------------------------------------
+       // Check Lot
+       //---------------------------------------------------------------------
+       dcl-proc  checkLot_SP;
+
+         available = 0;
+
+         Exec SQL
+           Select QUANTITY_AVAILABLE into :available
+             from TGMSDATA.Inv_Plugs_Ready_union_Spec_w_holdback
+             where READY_DATE = :mondayDate
+               and ITEM_NUMBER = :item
+               and ITEM_SIZE = :size
+           Fetch First Row Only;
+
+       end-proc;
+
+       //---------------------------------------------------------------------
+       // Check Custom
+       //---------------------------------------------------------------------
+       dcl-proc  checkCustom_SP;
+         dcl-s firstAvailable date;
+         dcl-s thisWeek Zoned(2:0);
+         dcl-s weeksToGrow Zoned(2:0);
+         dcl-s addWeeks Zoned(2:0);
+
+         Exec SQL  //  Get the item master record
+           Select * into :FMINVT_DS
+             From FMINVT
+             Where IMITEM = :item
+               and IMSIZE = :size;
+
+         Exec SQL  //  Get the current week number
+           Select WEEK_NUMBER into :thisWeek
+             From FCALEN_ALL
+             Where DATEFLD = current Date;
+
+         Select;   // Calculate weeks to grow based on current week
+           When thisWeek >= IMBD1 and thisWeek <= IMED1;
+             weeksToGrow = IMWG1;
+           When thisWeek >= IMBD2 and thisWeek <= IMED2;
+             weeksToGrow = IMWG2;
+           When thisWeek >= IMBD3 and thisWeek <= IMED3;
+             weeksToGrow = IMWG3;
+           When thisWeek >= IMBD4 and thisWeek <= IMED4;
+             weeksToGrow = IMWG4;
+           Other;
+             weeksToGrow = 10;
+             Command = 'SNDMSG MSG(''**** The Available Inventory ' +
+                       'program (GETAVLINV) identified a problem with ' +
+                       'the Growth Windows for item:' + %Trim(IMITEM) +
+                       '-' + IMSIZE + ' ' + %Trim(IMDES1) + '.  ' +
+                       'A default Value of 10 weeks was used.  Please ' +
+                       'use item maintenance to correct the windows.'') '  +
+                       'TOUSR(*SYSOPR)';
+             QCmdExc(Command:%Len(Command));
+         ENDSL;
+
+         Select;   //  Add extra weeks for seed/cutting purchase and from size
+           When IMFRSZ = '   ';  // <-- Seed Items
+             addWeeks = 1;           // Add 1 week
+           When IMFRSZ = 'CUT';  // <-- Cutting Items
+             addWeeks = 2;           // Add 2 weeks
+           Other;                // <-- Item grown from a plug tray
+             addWeeks = 2; // Defauilt to 2 If from size not found
+             Exec SQL // Get Max Weeks to grow from From Item
+               Select   Max(FMINVT.IMWG1
+                           ,FMINVT.IMWG2
+                           ,FMINVT.IMWG3
+                           ,FMINVT.IMWG4)
+               + Case  when IMFRSZ = 'SED' then int(1)
+                       when IMFRSZ = 'CUT' then int(2)
+                       else int(2) end
+               Into :addWeeks
+               From FMINVT
+               Where IMITEM = :IMITEM
+                 and IMSIZE = :IMFRSZ;
+         ENDSL;
+
+         Exec SQL
+           Set :firstAvailable =
+                current date + ((:weeksToGrow + :addWeeks) * 7 )days;
+
+         // If the firstAvailable Date is
+         //    Greater than the requested date, we can grow it.
+         If firstAvailable >= mondayDate;
+           available = 999999999.99;
+         ENDIF;
+
+       end-proc; 
